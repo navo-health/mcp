@@ -18,8 +18,8 @@ def load_skills(skill_paths):
 
 
 skills = load_skills([
-    "simple_addition_skill/SKILL.md",
-    "goodreads_skill/SKILL.md"
+    "skills/datetime_skill/SKILL.md",
+    "skills/simple_addition_skill/SKILL.md"
 ])
 
 # Initialize agent with SkillToolset
@@ -30,3 +30,5 @@ root_agent = Agent(
     tools=[toolset],
 )
 
+def build_agent():
+    return root_agent
