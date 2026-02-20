@@ -3,3 +3,6 @@ uvicorn
 pydantic
 google-adk-agents
 google-genai
+python-dotenv
+fastmcp
+httpx
