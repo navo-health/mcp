@@ -9,7 +9,7 @@ from starlette.responses import JSONResponse
 
 SKILLS_DIR = Path(__file__).parent / "skills"
 
-mcp = FastMCP(host="127.0.0.1", port=8080)
+mcp = FastMCP()
 
 # Track registered tool names so we can cleanly remove them on reload
 _registered_tools: list[str] = []
@@ -70,4 +70,4 @@ async def reload_endpoint(request: Request) -> JSONResponse:
 load_skills()
 
 if __name__ == "__main__":
-    mcp.run(transport="sse")
+    mcp.run(transport="sse", host="127.0.0.1", port=8080)

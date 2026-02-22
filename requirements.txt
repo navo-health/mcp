@@ -1,8 +1,9 @@
 fastapi
 uvicorn
 pydantic
-google-adk-agents
+google-adk
 google-genai
 python-dotenv
 fastmcp
 httpx
+elasticsearch

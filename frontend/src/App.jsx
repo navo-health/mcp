@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import Chat from "./components/Chat.jsx";
 import SkillUploadForm from "./components/SkillUploadForm.jsx";
 import SkillList from "./components/SkillList.jsx";
 
@@ -61,6 +62,12 @@ export default function App() {
       </header>
 
       {error && <div className="error-banner">{error}</div>}
+
+      <Chat />
+
+      <div className="section-label" style={{ marginTop: "2rem" }}>
+        Skill Management
+      </div>
 
       <SkillUploadForm
         onCreate={async (payload) => {
