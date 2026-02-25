@@ -1,5 +1,3 @@
-import os
-import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -9,7 +7,6 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-import httpx
 from elasticsearch import Elasticsearch, NotFoundError
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,8 +16,6 @@ from pydantic import BaseModel
 
 from multi_tool_agent.agent import build_agent
 
-SKILLS_DIR = Path(__file__).parent / "skills"
-MCP_RELOAD_URL = "http://127.0.0.1:8080/reload"
 ES_INDEX = "skills"
 
 # ── Elasticsearch setup ─────────────────────────────────────────────
@@ -36,39 +31,72 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-agent = build_agent()
-runner = InMemoryRunner(agent=agent, app_name="skills_gateway")
+# ── Agent state (mutable so we can rebuild dynamically) ─────────────
+_state = {"runner": None}
+
+
+def _load_skill_instructions_from_es() -> str:
+    """Load skill instructions from Elasticsearch."""
+    try:
+        _ensure_es_index()
+        result = es.search(
+            index=ES_INDEX,
+            body={"query": {"match_all": {}}, "size": 1000, "sort": [{"name": "asc"}]},
+        )
+        skill_names = [hit["_source"].get("name", "unknown") for hit in result["hits"]["hits"]]
+        print(f"[ES Query] Found {len(skill_names)} skills: {skill_names}")
+        parts = []
+        for hit in result["hits"]["hits"]:
+            description = hit["_source"].get("description", "")
+            if description:
+                parts.append(description)
+        if not parts:
+            return "You have no skills loaded. Tell the user to upload skills first."
+
+        # Make instructions explicit for the LLM
+        skill_list = ", ".join(skill_names)
+        instructions = f"""You are a helpful assistant with the following skills: {skill_list}.
+
+You MUST use these skills to help users. Here are your skill descriptions:
+
+{chr(10).join(parts)}
+
+IMPORTANT: You can perform ALL the skills listed above. Do not say you cannot do something if it's in your skills."""
+        return instructions
+    except Exception as exc:
+        print(f"Warning: Failed to load skills from ES — {exc}")
+        return "You have no skills loaded. Tell the user to upload skills first."
+
+
+def _create_runner() -> InMemoryRunner:
+    """Create a fresh runner with current skills from Elasticsearch."""
+    instructions = _load_skill_instructions_from_es()
+    print(f"[_create_runner] Instructions: {instructions[:200]}...")
+    agent = build_agent(instructions)
+    runner = InMemoryRunner(agent=agent, app_name="skills_gateway")
+    print("[_create_runner] Fresh runner created")
+    return runner
+
+
+def _rebuild_agent():
+    """Rebuild the agent and runner with current skills from Elasticsearch."""
+    _state["runner"] = _create_runner()
+    print(f"[_rebuild_agent] Global runner updated to: {id(_state['runner'])}")
+
+
+def get_runner() -> InMemoryRunner:
+    """Get the current runner, building if needed."""
+    if _state["runner"] is None:
+        _rebuild_agent()
+    runner = _state["runner"]
+    print(f"[get_runner] Returning runner: {id(runner)}")
+    return runner
 
 
 @app.on_event("startup")
-def import_existing_skills():
-    """On startup, import any existing disk skills into Elasticsearch."""
-    try:
-        if not es.ping():
-            print("Warning: Elasticsearch not available at startup, skipping import")
-            return
-        _ensure_es_index()
-        if not SKILLS_DIR.is_dir():
-            return
-        for folder in SKILLS_DIR.iterdir():
-            if not folder.is_dir() or folder.name.startswith("."):
-                continue
-            skill_md = folder / "SKILL.md"
-            skill_py = folder / "skill.py"
-            if not skill_md.exists():
-                continue
-            # Only import if not already in ES
-            if not es.exists(index=ES_INDEX, id=folder.name):
-                doc = {
-                    "name": folder.name,
-                    "description": skill_md.read_text(),
-                    "code": skill_py.read_text() if skill_py.exists() else None,
-                    "created_at": datetime.utcnow().isoformat(),
-                }
-                es.index(index=ES_INDEX, id=folder.name, document=doc)
-                print(f"Imported skill '{folder.name}' into Elasticsearch")
-    except Exception as exc:
-        print(f"Warning: Failed to import skills to Elasticsearch — {exc}")
+def startup():
+    """Initialize the agent."""
+    _rebuild_agent()
 
 
 # ── Request / Response models ────────────────────────────────────────
@@ -104,32 +132,6 @@ def _ensure_es_index():
         )
 
 
-def _sync_skills_to_disk():
-    """Sync all skills from Elasticsearch to the file system for the agent."""
-    _ensure_es_index()
-    try:
-        result = es.search(index=ES_INDEX, body={"query": {"match_all": {}}, "size": 1000})
-        for hit in result["hits"]["hits"]:
-            skill = hit["_source"]
-            skill_dir = SKILLS_DIR / skill["name"]
-            skill_dir.mkdir(parents=True, exist_ok=True)
-            (skill_dir / "SKILL.md").write_text(skill.get("description", ""))
-            if skill.get("code"):
-                (skill_dir / "skill.py").write_text(skill["code"])
-    except Exception as exc:
-        print(f"Warning: Failed to sync skills to disk — {exc}")
-
-
-async def _reload_mcp():
-    """Tell the MCP server to re-scan skills/."""
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(MCP_RELOAD_URL, timeout=5.0)
-            resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        print(f"Warning: MCP reload failed — {exc}")
-
-
 # ── Endpoints ────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -137,16 +139,33 @@ def root():
     return {"status": "Skills Gateway running"}
 
 
+@app.get("/debug/instructions")
+def debug_instructions():
+    """Debug endpoint to see current agent instructions."""
+    return {"instructions": _load_skill_instructions_from_es()}
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest):
+    runner = get_runner()
     content = types.Content(
         role="user",
         parts=[types.Part.from_text(text=request.message)],
     )
 
+    # Try to use existing session, or create a new one
+    session_id = None
     if request.session_id:
-        session_id = request.session_id
-    else:
+        # Check if session still exists (may be gone after agent rebuild)
+        existing = await runner.session_service.get_session(
+            app_name="skills_gateway",
+            user_id="user1",
+            session_id=request.session_id,
+        )
+        if existing:
+            session_id = request.session_id
+
+    if not session_id:
         session = await runner.session_service.create_session(
             app_name="skills_gateway",
             user_id="user1",
@@ -185,25 +204,30 @@ def _extract_description(text: str, max_length: int = 150) -> str:
     return ""
 
 
+def _get_skills_list():
+    """Get all skills from Elasticsearch as a list."""
+    result = es.search(
+        index=ES_INDEX,
+        body={"query": {"match_all": {}}, "size": 1000, "sort": [{"name": "asc"}]},
+    )
+    skills = []
+    for hit in result["hits"]["hits"]:
+        source = hit["_source"]
+        skills.append({
+            "name": source["name"],
+            "has_skill_md": bool(source.get("description")),
+            "has_skill_py": bool(source.get("code")),
+            "description": _extract_description(source.get("description", "")),
+        })
+    return skills
+
+
 @app.get("/skills")
 def list_skills():
     """List all skills from Elasticsearch."""
     _ensure_es_index()
     try:
-        result = es.search(
-            index=ES_INDEX,
-            body={"query": {"match_all": {}}, "size": 1000, "sort": [{"name": "asc"}]},
-        )
-        skills = []
-        for hit in result["hits"]["hits"]:
-            source = hit["_source"]
-            skills.append({
-                "name": source["name"],
-                "has_skill_md": bool(source.get("description")),
-                "has_skill_py": bool(source.get("code")),
-                "description": _extract_description(source.get("description", "")),
-            })
-        return {"skills": skills}
+        return {"skills": _get_skills_list()}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to list skills: {exc}")
 
@@ -224,34 +248,25 @@ async def create_skill(request: SkillCreateRequest):
         "code": request.code,
         "created_at": datetime.utcnow().isoformat(),
     }
-    es.index(index=ES_INDEX, id=request.name, document=doc)
+    es.index(index=ES_INDEX, id=request.name, document=doc, refresh=True)
+    print(f"[create_skill] Stored skill '{request.name}' in ES")
 
-    # Sync to disk for the agent
-    skill_dir = SKILLS_DIR / request.name
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text(request.description)
-    if request.code:
-        (skill_dir / "skill.py").write_text(request.code)
-
-    await _reload_mcp()
-    return {"status": "created", "name": request.name}
+    # Rebuild agent to pick up new skill
+    _rebuild_agent()
+    return {"status": "created", "name": request.name, "skills": _get_skills_list()}
 
 
 @app.delete("/skills/{name}")
 async def delete_skill(name: str):
-    """Delete a skill from Elasticsearch and disk."""
+    """Delete a skill from Elasticsearch (keeps files on disk)."""
     _ensure_es_index()
 
     # Check if skill exists in ES
     try:
-        es.delete(index=ES_INDEX, id=name)
+        es.delete(index=ES_INDEX, id=name, refresh=True)
     except NotFoundError:
         raise HTTPException(status_code=404, detail=f"Skill '{name}' not found")
 
-    # Remove from disk
-    skill_dir = SKILLS_DIR / name
-    if skill_dir.exists():
-        shutil.rmtree(skill_dir)
-
-    await _reload_mcp()
-    return {"status": "deleted", "name": name}
+    # Rebuild agent to remove deleted skill
+    _rebuild_agent()
+    return {"status": "deleted", "name": name, "skills": _get_skills_list()}

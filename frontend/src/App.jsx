@@ -37,21 +37,23 @@ export default function App() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, description }),
     });
+    const data = await res.json();
     if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new Error(body.detail || `Upload failed (${res.status})`);
+      throw new Error(data.detail || `Upload failed (${res.status})`);
     }
-    await fetchSkills();
+    // Use skills from response directly instead of refetching
+    setSkills(data.skills);
   }
 
   async function handleDelete(name) {
     const res = await fetch(`/api/skills/${name}`, { method: "DELETE" });
+    const data = await res.json();
     if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      setError(body.detail || `Delete failed (${res.status})`);
+      setError(data.detail || `Delete failed (${res.status})`);
       return;
     }
-    await fetchSkills();
+    // Use skills from response directly instead of refetching
+    setSkills(data.skills);
   }
 
   return (

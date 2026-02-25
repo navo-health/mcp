@@ -5,3 +5,4 @@ dist/
 build/
 *.log
 skills/.adk/**
+.DS_Store

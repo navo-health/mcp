@@ -1,3 +1,3 @@
-def add_numbers(a: int, b: int) -> int:
-    """Adds two numbers together and returns the sum."""
+def add(a: int, b: int) -> int:
+    """Add two integers and return the sum."""
     return a + b
